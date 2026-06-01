@@ -1,0 +1,145 @@
+esphome:
+  name: qingping-pm-sensor
+  friendly_name: QingPing PM Sensor
+  # NOTE: stock unpatched firmware NEVER drives PA4 — the mode-byte at
+  # SRAM 0x20000038 has no writers anywhere in the binary, so the USART1
+  # init + TX paths are never reached.  Buttons below are only useful on
+  # firmware patched per tools/patch_firmware.py (4-byte
+  # literal-pool change + 0xC400=0x01).  Until that patch is flashed,
+  # neither :m1 nor BM 0x20 0x02 have any effect — the parser isn't run.
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0  # disable serial logger to keep UART0 free
+  level: DEBUG
+  logs:
+    uart_arduino: DEBUG
+    uart_idf: DEBUG
+    pmsx003: DEBUG
+    sensor: DEBUG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Qingping Debug Fallback"
+
+substitutions:
+  # ── Adjust GPIO pins for your board ──────────────────────────────────────
+  uart_rx_pin: GPIO27   # connects to pogo pin 3 (PA4, sensor TX)
+  uart_tx_pin: GPIO14   # connects to pogo pin 4 (PA5, sensor RX)
+  # ─────────────────────────────────────────────────────────────────────────
+
+captive_portal:
+
+# Local web UI — open http://<ip>/ to press buttons and see logs in browser
+web_server:
+  port: 80
+
+# ── UART ─────────────────────────────────────────────────────────────────────
+uart:
+  id: uart_bus
+  rx_pin: ${uart_rx_pin}
+  tx_pin: ${uart_tx_pin}
+  baud_rate: 9600
+  debug:
+    direction: BOTH
+    dummy_receiver: true
+    after:
+      timeout: 200ms   # collect bytes until 200ms of silence, then log one chunk
+      # This groups a full response packet into one log line.
+      # If the sensor is streaming ~1Hz, each frame will appear as one log entry.
+
+# ── Command buttons ───────────────────────────────────────────────────────────
+# TX bytes appear in log tagged [D][uart.debug:...] >>> ...
+# RX bytes appear in log tagged [D][uart.debug:...] <<< ...
+
+button:
+
+  # ── ASCII commands ──────────────────────────────────────────────────────
+
+  - platform: template
+    name: ":m1 enable output"
+    on_press:
+      - uart.write: { id: uart_bus, data: [0x3A, 0x6D, 0x31, 0x00, 0x00] }
+      # Expect: sensor starts emitting 32-byte BM frames ~1/s
+
+  - platform: template
+    name: ":m0 disable output"
+    on_press:
+      - uart.write: { id: uart_bus, data: [0x3A, 0x6D, 0x30, 0x00, 0x00] }
+      # Expect: sensor goes quiet
+
+  - platform: template
+    name: ":ver? query version"
+    on_press:
+      - uart.write: { id: uart_bus, data: [0x3A, 0x76, 0x65, 0x72, 0x3F] }
+      # Expect: 21-byte BM response containing version string "V1.0.03.230201 ..."
+
+  - platform: template
+    name: ":id? query device ID"
+    on_press:
+      - uart.write: { id: uart_bus, data: [0x3A, 0x69, 0x64, 0x3F, 0x00] }
+      # Expect: 21-byte BM response with device ID at bytes 10-13
+
+  - platform: template
+    name: ":para read thresholds"
+    on_press:
+      - uart.write: { id: uart_bus, data: [0x3A, 0x70, 0x61, 0x72, 0x61] }
+      # Expect: 2 raw bytes — PM threshold high byte, sensitivity value
+
+  # ── Binary BM commands ─────────────────────────────────────────────────
+  # Frame format: 42 4D [cmd] [d1] [d2] [ck_hi] [ck_lo]
+  # Checksum = 16-bit sum of bytes 0–4, big-endian
+
+  - platform: template
+    name: "BM 0xE1 query operating mode"
+    on_press:
+      # sum(42 4D E1 00 00) = 0x170
+      - uart.write: { id: uart_bus, data: [0x42, 0x4D, 0xE1, 0x00, 0x00, 0x01, 0x70] }
+      # Expect: 8-byte response  42 4D 00 04 E1 [state] [ck_hi] [ck_lo]
+
+  - platform: template
+    name: "BM 0xE4 hardware state query"
+    on_press:
+      # sum(42 4D E4 00 00) = 0x173
+      - uart.write: { id: uart_bus, data: [0x42, 0x4D, 0xE4, 0x00, 0x00, 0x01, 0x73] }
+      # Expect: 8-byte response  42 4D 00 04 E4 [state] [ck_hi] [ck_lo]
+
+  - platform: template
+    name: "BM 0x23 query sensor state (safe)"
+    on_press:
+      # sum(42 4D 23 02 01) = 0xB5  — read-only query, does not modify state
+      - uart.write: { id: uart_bus, data: [0x42, 0x4D, 0x23, 0x02, 0x01, 0x00, 0xB5] }
+      # Expect: 7-byte response with internal sensor state byte
+
+  - platform: template
+    name: "BM 0x12 query device ID (binary)"
+    on_press:
+      # sum(42 4D 12 00 00) = 0xFF
+      - uart.write: { id: uart_bus, data: [0x42, 0x4D, 0x12, 0x00, 0x00, 0x00, 0xFF] }
+      # Expect: 21-byte BM response with device ID
+
+  # ── BM 0x20 02 — set+persist auto-output flag ───────────────────────────
+  # On PATCHED firmware (see ../tools/patch_firmware.py) this sets pcVar3[0x7C]
+  # to 1 and persists it to flash 0xC400.  On stock firmware this byte is
+  # already re-purposed as the mode selector by the patch, so on a patched
+  # unit pressing this button only affects the (largely unused) auto-output
+  # flag — it does NOT change the boot mode.
+  - platform: template
+    name: "BM 0x20 02 — set auto-output flag (patched fw only)"
+    on_press:
+      # cmd=0x20 data=0x0002  sum(42 4D 20 02 00) = 0xB1
+      - uart.write: { id: uart_bus, data: [0x42, 0x4D, 0x20, 0x02, 0x00, 0x00, 0xB1] }

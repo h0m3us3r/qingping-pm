@@ -1,0 +1,118 @@
+esphome:
+  name: qingping-pm-sensor
+  friendly_name: Qingping PM Sensor
+  # The on-the-wire 32-byte BM frame is NOT a standard PMS/PMSX003 frame.
+  # See components/qingping_pm/qingping_pm.h for the firmware-verified layout.
+  # Requires the SWD patch (see swd_patcher/) to be applied first so the
+  # module boots in mode 1 and continuously emits frames on PA4 at 9600 8N1.
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# ── External component: the BM-frame parser lives in components/qingping_pm/ ──
+# Pulled fresh from GitHub on every compile (`refresh: 0s`) so you always get
+# the newest schema/parser without remembering to bump a ref.
+external_components:
+  - source: github://h0m3us3r/qingping-pm
+    components: [qingping_pm]
+    refresh: 0s
+  # Alternative — point at a local checkout (e.g. when iterating). The
+  # `tools/flash.sh` helper mounts the repo root at /config so `../components`
+  # resolves to <repo>/components.
+  # - source:
+  #     type: local
+  #     path: ../components
+  #   components: [qingping_pm]
+
+substitutions:
+  uart_rx_pin: GPIO27   # connects to pogo pin 3 (PA4, module TX)
+  uart_tx_pin: GPIO14   # connects to pogo pin 4 (PA5, module RX) — optional
+
+# ── UART ─────────────────────────────────────────────────────────────────────
+uart:
+  id: uart_bus
+  rx_pin: ${uart_rx_pin}
+  tx_pin: ${uart_tx_pin}
+  baud_rate: 9600
+  rx_buffer_size: 256
+
+# ── Shared filter pipeline applied to every raw bin ──────────────────────────
+# Each bin is published as the AVERAGE peak count per second over the last
+# 60 frames (60 ≈ 1 minute at the firmware's 1 Hz emit rate). The window
+# truly slides: it recomputes and republishes every new sample, so the
+# value tracks events with ~1 s latency rather than waiting a minute.
+#
+# Partial-window correctness: the average is over however many samples have
+# arrived so far, so the first frame shows the raw 1 s value, the tenth
+# shows the average of those ten, etc. No startup-inflation artefact.
+#
+# Derived sensors that need the instantaneous 1 Hz value (e.g. Particle
+# rate Δ) should read `get_raw_state()` of these bin sensors — see the
+# template lambda below.
+.bin_filters: &bin_filters
+  - sliding_window_moving_average:
+      window_size: 60        # 60 frames ≈ 60 s
+      send_every: 1          # re-emit on every new sample (truly sliding)
+  - multiply: 60.0           # mean → 60-s sum (inflated until buffer fills)
+  - delta: 0.5               # suppress identical-integer re-sends
+
+# ── The PM module ────────────────────────────────────────────────────────────
+# Raw histogram bins. Mutually exclusive: each peak is counted in exactly one
+# bin (the highest threshold T_i it exceeds). bin_i covers the band
+# (T_{i+1}, T_i]. bin_0 = largest particles, bin_10 = smallest.
+qingping_pm:
+  uart_id: uart_bus
+  bin_0:  { name: "Bin 0 (3100+)", id: bin_0,  filters: *bin_filters }
+  bin_1:  { name: "Bin 1 (2430+)", id: bin_1,  filters: *bin_filters }
+  bin_2:  { name: "Bin 2 (2030+)", id: bin_2,  filters: *bin_filters }
+  bin_3:  { name: "Bin 3 (1630+)", id: bin_3,  filters: *bin_filters }
+  bin_4:  { name: "Bin 4 (1330+)", id: bin_4,  filters: *bin_filters }
+  bin_5:  { name: "Bin 5 (1030+)", id: bin_5,  filters: *bin_filters }
+  bin_6:  { name: "Bin 6 (810+)",  id: bin_6,  filters: *bin_filters }
+  bin_7:  { name: "Bin 7 (650+)",  id: bin_7,  filters: *bin_filters }
+  bin_8:  { name: "Bin 8 (450+)",  id: bin_8,  filters: *bin_filters }
+  bin_9:  { name: "Bin 9 (100+)",  id: bin_9,  filters: *bin_filters }
+  bin_10: { name: "Bin 10 (50+)",  id: bin_10, filters: *bin_filters }
+  baseline:        { name: "Detector baseline",     filters: [{ delta: 0.5 }] }
+  frames_received: { name: "BM frames received", filters: [{ delta: 60 }] }
+  bad_checksums:   { name: "BM bad-checksum count", filters: [{ delta: 0.5 }] }
+  # Instantaneous total peak rate and its second-to-second change, both
+  # computed inside the component once per BM frame (~1 Hz) and published
+  # directly. NOTE: do NOT add a `heartbeat:` filter — in ESPHome that's a
+  # downsampler that drops everything between ticks, not a "republish every
+  # N seconds in addition" floor. Use plain `delta` to throttle re-sends.
+  particle_rate:
+    name: "Particle rate"
+    filters:
+      - delta: 5.0
+  particle_rate_delta:
+    name: "Particle rate Δ"
+    filters:
+      # Quantise to nearest multiple of 5 so |Δ| < 2.5 reads as 0 and the
+      # value only ever moves in ±5 steps; the delta filter then suppresses
+      # repeats of the same step.
+      - lambda: "return round(x / 5.0f) * 5.0f;"
+      - delta: 1.0
+
+# ── Derived sensors (live entirely in YAML) ──────────────────────────────────
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s

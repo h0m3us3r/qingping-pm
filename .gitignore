@@ -1,0 +1,21 @@
+# PlatformIO build / IDE
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ESPHome build output
+.esphome/
+secrets.yaml
+
+# OS junk
+.DS_Store
+Thumbs.db
